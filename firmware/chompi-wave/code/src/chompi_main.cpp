@@ -1,421 +1,587 @@
-/** @file chompi_main.cpp
- *  @brief Firmware entry point
+/**
+ * CHOMPI Endless v0.1
  *
- *  CHOMPI (built on the Daisy Seed / STM32H7) has three places code runs, in
- *  order of priority:
- *   1. AudioCallback() - the audio ISR. Runs once per audio block (~24 samples
- *      at 48kHz here)
- *   2. SDCallback() - a lower-priority hardware timer callback for work that's
- *      too slow for the audio ISR but still needs to happen without 
- *      waiting on the main loop. Does one FileStreamingManager 
- *      request per tick so SD reads/writes never block audio. This was more important
- *      in TAPE which is constantly reading from the SD card, but the architecture is
- *      kept the same here.
- *   3. MainLoop() - Lowest priority, handles UI polling, MIDI I/O, and boot-time stuff.
+ * Five-layer endless sustain instrument.
+ *
+ * Controls:
+ *   White layer key 1..5 + RED : record/replace that layer
+ *   RED while recording        : stop recording
+ *   GREEN                      : global Play / Stop
+ *   Knob 1                     : WINDOW
+ *   Knob 2                     : FADE
+ *   Knob 3                     : DRIFT
+ *   Knob 4                     : COLOR
+ *   Purple encoder             : SPEED / PITCH
+ *   RED + Purple encoder       : REVERB
+ *   Knob 6                     : MASTER VOLUME
+ *
+ * Every parameter temporarily takes over the 25 key LEDs as a value bar.
  */
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+
 #include "hardware.h"
 #include "temp_led_stuff.h"
-#include "ui.h"
 #include "daisysp.h"
-#include "fatfs.h"
-#include "diskio.h"
-#include "subtractiveEngine.h"
-#include "Sequencer.h"
-#include "InterpolatedDelayLine.h"
-#include "OptionsManager.h"
-#include "WavetableManager.h"
-#include "clockManager.h"
-#include "MidiManager.h"
+#include "reverb.h"
+#include "EndlessEngine.h"
 
 #define DSY_DTCMRAM_BSS __attribute__((section(".dtcmram_bss")))
 
-#define MAX_CYCLES 256
-#define MAX_SAMPLES_PER_CYCLE 2048
-
 using namespace daisy;
 using namespace chompi;
-FIFO<int16_t, kMaxFileStreamingSamps> test_read_samps;
+
+namespace
+{
+constexpr std::size_t kSampleRateHz = 48000;
+constexpr float kSampleRate = static_cast<float>(kSampleRateHz);
+constexpr std::size_t kMaxLayerSeconds = 4;
+constexpr std::size_t kMaxLayerFrames = kSampleRateHz * kMaxLayerSeconds;
+
+constexpr float kMicGain = 5.f;
+constexpr float kLineGain = 3.f;
+constexpr float kHeadphoneGain = 0.20f;
+constexpr float kLineOutGain = 0.30f;
 
 Hardware hw;
-UserInterface ui;
-
-SdmmcHandler sdmmc;
-FatFSInterface fsi;
-myEngine engine;
-PresetManager presets;
-OptionsManager options;
-wavetableLoader wtLoader;
-Sequencer seq;
-clockManager cManager;
-MidiManager midi;
-
-bool testLoad; // To make sure wavetables don't get loaded until later
-
+neoclo::EndlessEngine engine;
 daisysp::Reverb DSY_DTCMRAM_BSS reverb;
-chompi::InterpolatedDelayLine::AudioSample DSY_SDRAM_BSS del_mem[kMaxDelayTime];
 
-float wavetableMemory[MAX_CYCLES][MAX_SAMPLES_PER_CYCLE] __attribute__((section(".sdram_bss")));
+int16_t DSY_SDRAM_BSS layer_memory
+    [neoclo::EndlessEngine::kLayers]
+    [neoclo::EndlessEngine::kBanks]
+    [kMaxLayerFrames * 2];
 
-daisysp::Oscillator osc;
+daisysp::DcBlock dc_mic;
+daisysp::DcBlock dc_line_l;
+daisysp::DcBlock dc_line_r;
 
-// CpuLoadMeter meter;
-uint32_t pret, sd_checkt;
-// bool log_batt;
-bool booting = true;
-bool rainbow_done = false;
-bool testSDLoaded;
-bool loading_screen = true;
-size_t loading_screen_time = 0;
+// First five WHITE keys: C, D, E, F, G.
+constexpr uint8_t kLayerKeyIds[5] = {15, 8, 9, 10, 11};
+constexpr uint8_t kLayerLedIds[5] = {24, 23, 22, 21, 20};
 
-/** breakdown:
- *  Inputs:
- *  Channel 1 - Microphone
- *  Channel 2 - X
- *  Channel 3 - Aux L
- *  Channel 3 - Aux R
- *
- *  Outputs:
- *  Channel 1 - Headphone L
- *  Channel 2 - Headphone R
- *  Channel 3 - Master L
- *  Channel 4 - Master R
- */
+// All 25 chromatic key LEDs, left to right.
+constexpr uint8_t kPlayableLedIds[25] = {
+    24, 0, 23, 1, 22, 21, 2, 20, 3, 19, 4, 18, 17,
+    5, 16, 6, 15, 14, 7, 13, 8, 12, 9, 11, 10};
 
-// The audio ISR. Called by the Daisy audio driver once per block
-void AudioCallback(AudioHandle::InputBuffer in, AudioHandle::OutputBuffer out, size_t size)
+// Official CHOMPI physical -> front-panel logical encoder mapping.
+constexpr uint8_t kEncoderMap[6] = {1, 2, 3, 0, 4, 5};
+
+// Front panel knob LEDs for logical knobs 1..6.
+constexpr uint8_t kKnobPthLed[6] = {1, 2, 3, 4, 0, 9};
+
+float window_amount = 0.34f;
+float fade_amount   = 0.72f;
+float drift_amount  = 0.10f;
+float color_amount  = 0.12f;
+float speed_pos     = 0.50f;
+float reverb_amount = 0.18f;
+float master_volume = 0.78f;
+
+bool red_held = false;
+bool layer_held[5] = {false, false, false, false, false};
+std::size_t selected_layer = 0;
+
+uint32_t led_time = 0;
+uint32_t battery_time = 0;
+
+enum class ParamDisplay : uint8_t
 {
-    // meter.OnBlockStart();
+    NONE,
+    WINDOW,
+    FADE,
+    DRIFT,
+    COLOR,
+    SPEED,
+    REVERB,
+    MASTER
+};
 
-    if((booting || loading_screen) && !ui.InTestMode())
-    {
-        hw.ProcessAllControls();
-        ui.GenerateEvents();
-        ui.DoEvents();
+ParamDisplay display_param = ParamDisplay::NONE;
+float display_value = 0.f;
+uint32_t display_until = 0;
 
-        for(size_t i = 0; i < size; i++)
-        {
-            out[0][i] = out[1][i] = out[2][i] = out[3][i] = 0.f;
-        }
-
-        return;
-    }
-
-    midi.ProcessMidiIn();
-
-    hw.ProcessAllControls();
-    ui.GenerateEvents();
-    if (seq.getPlaying()) {
-        seq.checkAndPop();
-    }
-    engine.Prepare();
-
-    if(ui.InTestMode() && ui.GetToggleState())
-    {
-        for(size_t i = 0; i < size; i++)
-        {
-            out[0][i] = out[1][i] = out[2][i] = out[3][i] = osc.Process();
-        }
-    }
-    else {
-        engine.Process(in, out, size);
-    }
-
-    // meter.OnBlockEnd();
+inline float Clamp(float x, float lo, float hi)
+{
+    return x < lo ? lo : (x > hi ? hi : x);
 }
 
-/** Clears the Daisy Seed 64MB external SDRAM bank at boot. Large audio stuff placed there
- *  (wavetableMemory, the delay line buffer). Not zero-initialized by the
- *  startup code the way internal-RAM statics are so without this it
- *  could play back stale/garbage SDRAM data */
+float SpeedFromPosition(float p)
+{
+    p = Clamp(p, 0.f, 1.f);
+    if(p <= 0.5f)
+        return 0.25f + p * 1.5f;   // 0.25x .. 1x
+    return 1.f + (p - 0.5f) * 2.f; // 1x .. 2x
+}
+
 void ZeroSDRAM()
 {
-    uint32_t *beg, *end;
-    size_t    size_in_words = (1024 * 1024 * 64) / sizeof(uint32_t);
-    beg                     = (uint32_t*)0xc0000000;
-    end                     = (uint32_t*)(beg + size_in_words);
-    std::fill(beg, end, 0);
+    uint32_t* beg = reinterpret_cast<uint32_t*>(0xc0000000);
+    const std::size_t words = (1024 * 1024 * 64) / sizeof(uint32_t);
+    std::fill(beg, beg + words, 0u);
 }
 
-bool no_sd_card = false;
-void CheckSDCardMounted()
+void ShowParam(ParamDisplay param, float value)
 {
-    DSTATUS res = disk_status(0);
-    // lost the SD card, must reboot
-    if(res != RES_OK)
+    display_param = param;
+    display_value = Clamp(value, 0.f, 1.f);
+    display_until = System::GetNow() + 1300;
+}
+
+void ParamColor(ParamDisplay param, float* r, float* g, float* b)
+{
+    switch(param)
     {
-        no_sd_card = true;
-        ui.NoSDCard();
-
-        const uint32_t start_time = System::GetNow();
-        while(System::GetNow() - start_time < 3000)
-        {
-            ui.NoSDCardAnimation(true);
-            ui.DoEvents();
-            System::Delay(1);
-        }
-
-        ui.NoSDCardAnimation(false);
+        case ParamDisplay::WINDOW: *r=.04f; *g=.78f; *b=1.f; break;
+        case ParamDisplay::FADE:   *r=.55f; *g=.82f; *b=1.f; break;
+        case ParamDisplay::DRIFT:  *r=.08f; *g=1.f;  *b=.55f; break;
+        case ParamDisplay::COLOR:  *r=1.f;  *g=.34f; *b=.03f; break;
+        case ParamDisplay::SPEED:  *r=.72f; *g=.08f; *b=1.f; break;
+        case ParamDisplay::REVERB: *r=.20f; *g=.25f; *b=1.f; break;
+        case ParamDisplay::MASTER: *r=1.f;  *g=1.f;  *b=1.f; break;
+        default:                   *r=0.f;  *g=0.f;  *b=0.f; break;
     }
 }
 
-void SDCallback(void* data)
+void UpdateReverb()
 {
-    const uint32_t now = System::GetNow();
-    if (now - sd_checkt > 1000 && !no_sd_card && !booting)
-    {
-        sd_checkt = now;
-        CheckSDCardMounted();
-    }
-    else if(no_sd_card)
+    reverb.SetAmount(reverb_amount * 0.82f);
+    reverb.SetInputGain(0.30f + reverb_amount * 0.18f);
+    reverb.SetTime(0.68f + reverb_amount * 0.29f);
+    reverb.SetDiffusion(0.63f + reverb_amount * 0.28f);
+    reverb.SetLowpass(0.38f + (1.f - reverb_amount) * 0.40f);
+}
+
+void StartLayerCapture(std::size_t layer)
+{
+    if(layer >= 5)
         return;
 
-    engine.ProcessFileRequests();
-
-    if(now - pret > 50)
-    {
-        pret = now;
-        ui.WritePresets();
-    }    
+    selected_layer = layer;
+    engine.StartCapture(layer);
 }
 
-uint32_t uit, now, pre_startt;
-
-#if !NO_BATT
-uint32_t batt;
-#endif
-
-uint8_t preset = 0;
-uint8_t bank = 0; 
-uint8_t mode = 0;
-
-TimerHandle midi_clock_timer;
-size_t tim_base_freq;
-
-/** Queues a MIDI clock pulse. CHOMPI runs on 12 PPQN, not 24. 24 created too much traffic
- * on the MIDI out bus. */
-void MidiClockCallback(void* ctx)
+void StopLayerCapture()
 {
-    if (seq.getPlaying() && options.midi_clock_out) {
-        midi.QueueMidiClock();
+    if(engine.IsCapturing())
+        engine.StopCapture();
+}
+
+int HeldLayer()
+{
+    for(int i = 0; i < 5; ++i)
+        if(layer_held[i])
+            return i;
+    return -1;
+}
+
+void ApplyEncoderTurn(uint8_t logical_knob, int inc)
+{
+    if(inc == 0)
+        return;
+
+    switch(logical_knob)
+    {
+        case 0:
+            window_amount = Clamp(window_amount + 0.02f * inc, 0.f, 1.f);
+            engine.SetWindow(window_amount);
+            ShowParam(ParamDisplay::WINDOW, window_amount);
+            break;
+
+        case 1:
+            fade_amount = Clamp(fade_amount + 0.02f * inc, 0.f, 1.f);
+            engine.SetFade(fade_amount);
+            ShowParam(ParamDisplay::FADE, fade_amount);
+            break;
+
+        case 2:
+            drift_amount = Clamp(drift_amount + 0.02f * inc, 0.f, 1.f);
+            engine.SetDrift(drift_amount);
+            ShowParam(ParamDisplay::DRIFT, drift_amount);
+            break;
+
+        case 3:
+            color_amount = Clamp(color_amount + 0.02f * inc, 0.f, 1.f);
+            engine.SetColor(color_amount);
+            ShowParam(ParamDisplay::COLOR, color_amount);
+            break;
+
+        case 4:
+            if(red_held)
+            {
+                reverb_amount = Clamp(reverb_amount + 0.02f * inc, 0.f, 1.f);
+                UpdateReverb();
+                ShowParam(ParamDisplay::REVERB, reverb_amount);
+            }
+            else
+            {
+                speed_pos = Clamp(speed_pos + 0.015f * inc, 0.f, 1.f);
+                engine.SetSpeed(SpeedFromPosition(speed_pos));
+                ShowParam(ParamDisplay::SPEED, speed_pos);
+            }
+            break;
+
+        case 5:
+            master_volume = Clamp(master_volume + 0.025f * inc, 0.f, 1.f);
+            ShowParam(ParamDisplay::MASTER, master_volume);
+            break;
     }
 }
 
-/** Setup for MIDI clock timer. Uses TIM_16 to not conflict with existing
- * libDaisy stuff. This was one of the modifications made to libDaisy to help
- * MIDI clock out work. libs/libDaisy/src/tim.cpp was changed from the
- * original libDaisy
- */
-void InitMidiClockTimer()
+void ProcessControls()
 {
-    TimerHandle::Config tim_cfg;
+    const int red_id   = static_cast<int>(Hardware::SwId::KEY_26);
+    const int green_id = static_cast<int>(Hardware::SwId::KEY_27);
 
-    tim_cfg.periph = TimerHandle::Config::Peripheral::TIM_16;
-    tim_cfg.dir    = TimerHandle::Config::CounterDir::UP;
-    tim_cfg.enable_irq = true;
-
-    midi_clock_timer.Init(tim_cfg);
-    midi_clock_timer.SetPrescaler(239);
-    midi_clock_timer.SetPeriod(15624);
-    midi_clock_timer.SetCallback(MidiClockCallback, nullptr);
-    midi_clock_timer.Start();
-}
-
-void MainLoop(void* data)
-{
-    if(booting)
+    // Layer keys first so simultaneous WHITE + RED works in the same audio block.
+    for(std::size_t i = 0; i < 5; ++i)
     {
-        hw.LowBatteryLockoutCheck();
-        booting = false;
-    }
-    else if(!rainbow_done && !loading_screen)
-    {
-        ui.StopBootAnimation();
-        ui.RainbowWave();
-        rainbow_done = true;
+        if(hw.button_sr.RisingEdge(kLayerKeyIds[i]))
+        {
+            layer_held[i] = true;
+            selected_layer = i;
+
+            // Also accept RED first, then layer key.
+            if(red_held && !engine.IsCapturing())
+                StartLayerCapture(i);
+        }
+
+        if(hw.button_sr.FallingEdge(kLayerKeyIds[i]))
+            layer_held[i] = false;
     }
 
-    // volatile float avg_load = meter.GetAvgCpuLoad();
-    // volatile float max_load = meter.GetMaxCpuLoad();
-    now = daisy::System::GetNow();
-
-    midi.ProcessMidiOut(); // We want midi checks to happen every 10uS for more precise timing
-
-    if (now - uit > 1)
+    // RED is capture/modifier.
+    if(hw.button_sr.RisingEdge(red_id))
     {
-        ui.DoEvents();
-        //ui.ProcessMidi();
-        uit = now;
-    }
+        red_held = true;
 
-    if (now - pre_startt > 1000) {
-        if (!testLoad) {
-            wtLoader.loadAllToMemory();
-            testLoad = true;
+        if(engine.IsCapturing())
+        {
+            StopLayerCapture();
+        }
+        else
+        {
+            const int layer = HeldLayer();
+            if(layer >= 0)
+                StartLayerCapture(static_cast<std::size_t>(layer));
         }
     }
 
-    // release the loading screen 250 ms after
-    // the wavetable requests drain; if they never drain (no card), it never releases
-    if (!testSDLoaded) {
-        //numWavetables guard: with no card the loader finds zero tables
-        //and queues nothing, so an empty request queue must not count as "loaded"
-        if (testLoad && wtLoader.numWavetables > 0 && engine.checkLoaded()) {
-            testSDLoaded = true;
-            ui.BootSelectDefaultSlot();
-            loading_screen_time = System::GetNow();
+    if(hw.button_sr.FallingEdge(red_id))
+        red_held = false;
+
+    // GREEN = global Play / Stop.
+    if(hw.button_sr.RisingEdge(green_id))
+    {
+        if(engine.IsCapturing())
+        {
+            StopLayerCapture();
+            engine.SetPlaying(true);
+        }
+        else
+        {
+            engine.SetPlaying(!engine.IsPlaying());
         }
     }
-    if (loading_screen_time) {
-        if (System::GetNow() - loading_screen_time > 250) {
-            loading_screen = false;
-            loading_screen_time = 0;
-        }
-    }
 
-    if (now - pre_startt > 5000)
+    for(int physical = 0; physical < 6; ++physical)
     {
-        ui.TestPresets();
-        pre_startt = now;
+        const int inc = hw.enc[physical].Increment();
+        if(inc != 0)
+            ApplyEncoderTurn(kEncoderMap[physical], inc);
     }
-
-    // update now to actually be now
-    now = daisy::System::GetNow();
-
-    #if !NO_BATT
-
-    if(ui.InRainbows())
-    {
-        batt = now;
-    }
-    else if(now - batt > 20)
-    {
-        hw.LowBatteryLockoutCheck();
-        batt = now;
-    }
-
-    if(ui.InTestMode())
-    {
-        hw.MpReadAll();
-
-        while (!hw.read_ready) {
-            System::Delay(1);
-        }
-        ui.TestPowerCable(hw.mp_buff_[1] >> 5 & 1); //VIN_RDY
-
-        // Normal NTC_MISSING, BATT_MISSING, NTC1_FAULT, and NTC2_FAULT
-        ui.TestBMC(hw.mp_buff_[3] == 0); 
-    }
-    #endif
-
-    System::DelayUs(10);
 }
 
-int main(void)
+void ReadInput(const float* const* in, std::size_t i, float* l, float* r)
 {
-    hw.Init();
+    if(hw.jack_detect.Read())
+    {
+        *l = Clamp(dc_line_l.Process(in[2][i] * kLineGain), -1.f, 1.f);
+        *r = Clamp(dc_line_r.Process(in[3][i] * kLineGain), -1.f, 1.f);
+    }
+    else
+    {
+        const float mic = Clamp(dc_mic.Process(in[0][i] * kMicGain), -1.f, 1.f);
+        *l = mic;
+        *r = mic;
+    }
+}
 
-    // System::Delay(100);
-    midi.Init(&cManager, &seq, &ui, &engine, &hw);
+void AudioCallback(AudioHandle::InputBuffer in,
+                   AudioHandle::OutputBuffer out,
+                   std::size_t size)
+{
+    hw.ProcessAllControls();
+    ProcessControls();
 
-    hw.MpWrite(0x0c, 0B01010001); // set BATT_LOW to 3V, turn on 
+    for(std::size_t i = 0; i < size; ++i)
+    {
+        float input_l = 0.f;
+        float input_r = 0.f;
+        ReadInput(in, i, &input_l, &input_r);
 
+        neoclo::EndlessEngine::Stereo sig = engine.Process(input_l, input_r);
+
+        // Monitor the new material while capturing so recording feels immediate.
+        if(engine.IsCapturing())
+        {
+            sig.l += input_l * 0.60f;
+            sig.r += input_r * 0.60f;
+        }
+
+        float wet_l = sig.l;
+        float wet_r = sig.r;
+        reverb.Process(&wet_l, &wet_r);
+
+        wet_l *= master_volume;
+        wet_r *= master_volume;
+
+        wet_l = Clamp(wet_l, -1.f, 1.f);
+        wet_r = Clamp(wet_r, -1.f, 1.f);
+
+        out[0][i] = wet_l * kHeadphoneGain;
+        out[1][i] = wet_r * kHeadphoneGain;
+        out[2][i] = wet_l * kLineOutGain;
+        out[3][i] = wet_r * kLineOutGain;
+    }
+}
+
+void DrawParameterBar()
+{
+    float r, g, b;
+    ParamColor(display_param, &r, &g, &b);
+
+    const float exact = display_value * 25.f;
+    const int full = static_cast<int>(exact);
+    const float partial = exact - static_cast<float>(full);
+
+    for(int i = 0; i < 25; ++i)
+    {
+        float level = 0.018f;
+
+        if(i < full)
+            level = 0.85f;
+        else if(i == full && i < 25)
+            level = 0.18f + partial * 0.67f;
+
+        SetSmtLedFloat(kPlayableLedIds[i],
+                       r * level,
+                       g * level,
+                       b * level);
+    }
+}
+
+void DrawLayerState()
+{
+    for(std::size_t i = 0; i < 25; ++i)
+        SetSmtLedFloat(kPlayableLedIds[i], 0.f, 0.f, 0.f);
+
+    const int rec_layer = engine.GetCaptureLayer();
+
+    for(std::size_t layer = 0; layer < 5; ++layer)
+    {
+        if(static_cast<int>(layer) == rec_layer)
+        {
+            const float pulse = ((System::GetNow() / 120) % 2) ? 1.f : 0.40f;
+            SetSmtLedFloat(kLayerLedIds[layer], pulse, 0.02f, 0.01f);
+        }
+        else if(engine.LayerHasAudio(layer))
+        {
+            if(layer == selected_layer)
+                SetSmtLedFloat(kLayerLedIds[layer], 0.05f, 1.f, 0.72f);
+            else
+                SetSmtLedFloat(kLayerLedIds[layer], 0.02f, 0.24f, 0.18f);
+        }
+        else if(layer == selected_layer)
+        {
+            SetSmtLedFloat(kLayerLedIds[layer], 0.04f, 0.10f, 0.12f);
+        }
+    }
+
+    // During recording use the remaining LEDs as progress.
+    if(engine.IsCapturing())
+    {
+        const float progress = engine.GetMaxFrames() > 0
+            ? static_cast<float>(engine.GetCaptureFrames())
+                / static_cast<float>(engine.GetMaxFrames())
+            : 0.f;
+
+        const int lit = std::min(25, static_cast<int>(progress * 25.f));
+        for(int i = 0; i < lit; ++i)
+        {
+            // Do not hide the layer-key indicator itself.
+            bool is_layer_led = false;
+            for(int l = 0; l < 5; ++l)
+                if(kPlayableLedIds[i] == kLayerLedIds[l])
+                    is_layer_led = true;
+
+            if(!is_layer_led)
+                SetSmtLedFloat(kPlayableLedIds[i], 0.32f, 0.01f, 0.01f);
+        }
+    }
+}
+
+void DrawKnobIndicators()
+{
+    for(int i = 0; i < 10; ++i)
+        SetPthLedFloat(i, 0.f, 0.f, 0.f);
+
+    const float vals[6] = {
+        window_amount,
+        fade_amount,
+        drift_amount,
+        color_amount,
+        speed_pos,
+        master_volume
+    };
+
+    const ParamDisplay params[6] = {
+        ParamDisplay::WINDOW,
+        ParamDisplay::FADE,
+        ParamDisplay::DRIFT,
+        ParamDisplay::COLOR,
+        ParamDisplay::SPEED,
+        ParamDisplay::MASTER
+    };
+
+    for(int i = 0; i < 6; ++i)
+    {
+        float r, g, b;
+        ParamColor(params[i], &r, &g, &b);
+        const float bright = 0.05f + vals[i] * 0.60f;
+        SetPthLedFloat(kKnobPthLed[i], r * bright, g * bright, b * bright);
+    }
+
+    // GREEN transport indicator.
+    if(engine.IsPlaying())
+        SetPthLedFloat(7, 0.03f, 1.f, 0.18f);
+    else
+        SetPthLedFloat(7, 0.02f, 0.08f, 0.02f);
+
+    // While RED is held, make the purple/reverb indicator blue-violet.
+    if(red_held)
+    {
+        const float bright = 0.10f + reverb_amount * 0.85f;
+        SetPthLedFloat(kKnobPthLed[4],
+                       0.18f * bright,
+                       0.22f * bright,
+                       1.f * bright);
+    }
+}
+
+void UpdateLeds()
+{
+    DrawKnobIndicators();
+
+    if(display_param != ParamDisplay::NONE
+       && static_cast<int32_t>(display_until - System::GetNow()) > 0)
+    {
+        DrawParameterBar();
+    }
+    else
+    {
+        display_param = ParamDisplay::NONE;
+        DrawLayerState();
+    }
+
+    fill_led_data();
+}
+
+void InitPowerManagement()
+{
+    hw.MpWrite(0x0c, 0B01010001);
     hw.MpReadAll();
 
-    for(size_t i = 0; i < 10; i++)
+    for(std::size_t i = 0; i < 10; ++i)
     {
         hw.LowBatteryLockoutCheck();
         System::Delay(10);
     }
+}
 
-    /** SDMMC Init */
-    System::Delay(100);
-    SdmmcHandler::Config sd_cfg;
-    sd_cfg.speed = SdmmcHandler::Speed::FAST;
-    sd_cfg.width = SdmmcHandler::BusWidth::BITS_4;
-    // sd_cfg.clock_powersave = true;
-    sdmmc.Init(sd_cfg);
-    System::Delay(100);
-    fsi.Init(FatFSInterface::Config::MEDIA_SD);
-    System::Delay(100);
-    f_mount(&fsi.GetSDFileSystem(), fsi.GetSDPath(), 1);
-
-    wtLoader.Init(&fsi.GetSDFileSystem(), wavetableMemory, hw.seed.AudioSampleRate());
-
-    // delete the battery log if it exists
-    char filename[32];
-    sprintf(filename, ".batt_log.txt");
-    f_unlink(filename);
-
-    // macos makes a copy
-    sprintf(filename, "._.batt_log.txt");
-    f_unlink(filename);
-
-
-    options.Init();
-    midi.setMidiOptions(options.midi_ch_in, options.midi_ch_out, options.midi_cc_in);
-    hw.setMidiCCOut(options.midi_cc_out);
-
-    LedSetup();
-    ui.Init(&cManager, &engine, &seq, &hw, &presets,
-        options.midi_ch_out);
-
-    tim_base_freq = System::GetPClk2Freq();
-    InitMidiClockTimer();
-    cManager.Init(&midi_clock_timer, tim_base_freq);
-    seq.Init(&engine, &cManager, &hw);
-
-    hw.StartLowPriorityCallback(SDCallback, 1000);
-    hw.StartAudio(AudioCallback);
-
-    ZeroSDRAM();
-
-    testLoad = false;
-    testSDLoaded = false;
-
-    // meter.Init(hw.seed.AudioSampleRate(), hw.seed.AudioBlockSize());
-
-    engine.Init(hw.seed.AudioSampleRate(), &del_mem[0], &reverb, &wtLoader);
-    
-    osc.Init(hw.seed.AudioSampleRate());
-    osc.SetAmp(.2f);
-
-    now = daisy::System::GetNow();
-    uit = now;
-    pret = now;
-    pre_startt = now;
-
-    #if !NO_BATT
-    batt = now;
-    #endif
-
-    // get any junk out of the SRs, takes .5s
-    uint32_t vol_state = 0;
+void SettleControlsAndCheckShippingMode()
+{
     uint32_t sleep_state = 0;
 
-    for(int i = 0; i < 5000; i++)
+    for(int i = 0; i < 5000; ++i)
     {
         hw.ProcessAllControls();
-        vol_state += hw.button_sr.State(int(Hardware::SwId::ENC_6_SW));
-        sleep_state += hw.button_sr.State(int(Hardware::SwId::KEY_26))
-                        && hw.button_sr.State(int(Hardware::SwId::KEY_27))
-                        && hw.button_sr.State(int(Hardware::SwId::KEY_28));
-
+        sleep_state += hw.button_sr.State(static_cast<int>(Hardware::SwId::KEY_26))
+                    && hw.button_sr.State(static_cast<int>(Hardware::SwId::KEY_27))
+                    && hw.button_sr.State(static_cast<int>(Hardware::SwId::KEY_28));
         System::DelayUs(100);
     }
 
     if(sleep_state > 4000)
-        hw.MpWrite(0x08, 0B10111111); // SHIPPING MODE
-    else if(vol_state > 4000)
-        ui.TestMode();
+        hw.MpWrite(0x08, 0B10111111);
+}
 
-    hw.usb_sw.Write(false);     // give USB control
-    daisy::System::Delay(1); // Wait a sec
-    hw.MpWrite(0x0a, 0B00100100); // AutoDPDM
-    daisy::System::Delay(1); // Wait a sec
-    hw.usb_sw.Write(true);     // take USB control
+void ConfigureUsbPowerHandoff()
+{
+    hw.usb_sw.Write(false);
+    System::Delay(1);
+    hw.MpWrite(0x0a, 0B00100100);
+    System::Delay(1);
+    hw.usb_sw.Write(true);
+}
 
-    while (1)
+} // namespace
+
+int main(void)
+{
+    hw.Init();
+    InitPowerManagement();
+
+    LedSetup();
+    ZeroSDRAM();
+
+    dc_mic.Init(kSampleRate);
+    dc_line_l.Init(kSampleRate);
+    dc_line_r.Init(kSampleRate);
+
+    int16_t* bank_ptrs[neoclo::EndlessEngine::kLayers]
+                      [neoclo::EndlessEngine::kBanks];
+
+    for(std::size_t layer = 0; layer < neoclo::EndlessEngine::kLayers; ++layer)
+        for(std::size_t bank = 0; bank < neoclo::EndlessEngine::kBanks; ++bank)
+            bank_ptrs[layer][bank] = &layer_memory[layer][bank][0];
+
+    engine.Init(kSampleRate, bank_ptrs, kMaxLayerFrames);
+    engine.SetWindow(window_amount);
+    engine.SetFade(fade_amount);
+    engine.SetDrift(drift_amount);
+    engine.SetColor(color_amount);
+    engine.SetSpeed(SpeedFromPosition(speed_pos));
+
+    reverb.Init(kSampleRate);
+    UpdateReverb();
+
+    SettleControlsAndCheckShippingMode();
+    ConfigureUsbPowerHandoff();
+
+    hw.StartAudio(AudioCallback);
+
+    led_time = battery_time = System::GetNow();
+
+    while(1)
     {
-        MainLoop(nullptr);
+        const uint32_t now = System::GetNow();
+
+        if(now - led_time >= 16)
+        {
+            UpdateLeds();
+            led_time = now;
+        }
+
+        if(now - battery_time >= 20)
+        {
+            hw.LowBatteryLockoutCheck();
+            battery_time = now;
+        }
+
+        System::DelayUs(100);
     }
 }
