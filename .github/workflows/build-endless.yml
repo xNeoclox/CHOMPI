@@ -1,0 +1,50 @@
+name: Build Endless firmware
+
+on:
+  push:
+    branches:
+      - endless-v0.1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM GCC 10.3.1
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p .toolchain
+          curl -L --fail --retry 3 \
+            -o /tmp/arm-gcc.tar.gz \
+            https://github.com/xpack-dev-tools/arm-none-eabi-gcc-xpack/releases/download/v10.3.1-2.3/xpack-arm-none-eabi-gcc-10.3.1-2.3-linux-x64.tar.gz
+          echo "559dcf1c2dfddac513110fe23da0ef254032c09967eaa901f075515d51818719  /tmp/arm-gcc.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/arm-gcc.tar.gz -C .toolchain
+          echo "$GITHUB_WORKSPACE/.toolchain/xpack-arm-none-eabi-gcc-10.3.1-2.3/bin" >> "$GITHUB_PATH"
+
+      - name: Verify compiler
+        run: arm-none-eabi-gcc --version
+
+      - name: Build CHOMPI.bin
+        working-directory: firmware/chompi-wave/code/src
+        run: |
+          make clean
+          make -j2
+          test -f build/CHOMPI.bin
+          ls -lh build/CHOMPI.bin build/CHOMPI.elf
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: CHOMPI-Endless-v0.1
+          path: |
+            firmware/chompi-wave/code/src/build/CHOMPI.bin
+            firmware/chompi-wave/code/src/build/CHOMPI.elf
+          if-no-files-found: error
+          retention-days: 30
