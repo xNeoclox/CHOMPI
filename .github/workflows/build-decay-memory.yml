@@ -3,7 +3,7 @@ name: Build Decay Memory firmware
 on:
   push:
     branches:
-      - decay-memory-v0.2
+      - decay-memory-v0.3
   workflow_dispatch:
 
 permissions:
@@ -42,7 +42,7 @@ jobs:
       - name: Upload firmware
         uses: actions/upload-artifact@v4
         with:
-          name: CHOMPI-Decay-Memory-v0.2
+          name: CHOMPI-Decay-Memory-v0.3
           path: |
             firmware/chompi-wave/code/src/build/CHOMPI.bin
             firmware/chompi-wave/code/src/build/CHOMPI.elf
