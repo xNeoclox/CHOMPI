@@ -271,7 +271,15 @@ void ProcessControls()
     }
 
     if(hw.button_sr.FallingEdge(red_id))
+    {
+        // Momentary capture workflow:
+        // WHITE + RED starts capture, releasing RED commits the layer
+        // and playback begins immediately.
+        if(engine.IsCapturing())
+            StopLayerCapture();
+
         red_held = false;
+    }
 
     // GREEN = global Play / Stop.
     if(hw.button_sr.RisingEdge(green_id))
