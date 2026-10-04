@@ -102,6 +102,9 @@ class EndlessEngine
         capture_layer_ = -1;
         capture_bank_  = -1;
         capture_write_ = 0;
+
+        // A completed capture must always become audible immediately.
+        playing_ = true;
     }
 
     void CancelCapture()
